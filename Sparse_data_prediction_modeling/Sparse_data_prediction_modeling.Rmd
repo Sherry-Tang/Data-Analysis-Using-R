@@ -1,0 +1,306 @@
+---
+title: "HW-3GroupPart"
+author: "sherry"
+date: "2020/11/6"
+output:
+  pdf_document:
+    df_print: kable
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r include= FALSE}
+library(dplyr)
+library(ggplot2)
+library('e1071') #Naive Bayes
+library('randomForest') #RandomForest
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(class)
+library(pROC)
+library(mltools)
+library(xgboost)
+require(Matrix)
+require(tidyr)
+require(dplyr)
+# theme package install
+library(devtools)
+#install.packages('devtools')
+# devtools::install_github('cttobin/ggthemr')
+library(ggthemr)
+```
+
+1. Load Data
+```{r}
+setwd("C:/Users/sherr/Sherry/Carlson/Courses/6130 Introduction to BA in R-Mochen Yang/HW3")
+xyz<-read.csv('XYZData.csv')
+xyz<-xyz[,c(2:27)]
+```
+
+3. Data Processing
+```{r}
+# Discretization of Age
+xyz<-xyz%>%mutate(AgeCat=as.factor(ifelse(age < 12, "kid", 
+                                    ifelse(age < 18, "teen",
+                                           ifelse(age < 30, "adult",
+                                                  ifelse(age < 57, "middle",
+                                                         ifelse(age < 80, "elder",'None')))))))
+#Normalize the data
+normalize = function(x){
+  return ((x - min(x))/(max(x) - min(x)))}
+xyz_norm = xyz %>% mutate_at(1:25, normalize)
+#Remove ourliers # this step helps to increase AUC 10%
+outliers <-boxplot(xyz_norm[,c(8:11)])$out
+x<-xyz_norm
+x<- x[-which(x$songsListened %in% outliers|
+               x$lovedTracks %in% outliers|
+               x$posts %in% outliers|
+               x$playlists %in% outliers|
+               x$shouts %in% outliers),]
+outliers <-boxplot(x[,c(8:12)])$out
+# One hot encoding the gender column
+x<-x%>%mutate(male=as.factor(male),
+              good_country=as.factor(good_country))
+x<-x[,-1]
+#Split train test data
+train_rows = createDataPartition(y = x$adopter, p = 0.80, list = FALSE)
+xyz_train = x[train_rows,]
+xyz_test = x[-train_rows,]
+```
+3. Exploratory Data Analysis
+```{r}
+ggthemr("dust")
+
+graph <- xyz %>% mutate(male=as.factor(male), adopter=as.factor(adopter), good_country=as.factor(good_country))
+# Binomial-data
+graph %>%
+  count(adopter, male) %>%
+  group_by(adopter) %>%
+  mutate(n = n/sum(n)*100) %>%
+  ggplot(aes(adopter, n, fill = male, label = paste0(round(n, 2), "%"))) + 
+  geom_col() +
+  geom_text(position=position_stack(0.5))+theme_classic()+
+  labs(title='Sex Ratio of Whether A User 
+Became A Subscriber within 6 Months',
+       y='Percentage',x='Adopter After Marketing Campaign',fill='Sex')+
+       scale_x_discrete(label=c('0'='Non-Adopter','1'='Adopter'))+
+       scale_fill_discrete(label=c('0'='Female','1'='Male'))
+graph %>%
+  count(adopter, good_country) %>%
+  group_by(adopter) %>%
+  mutate(n = n/sum(n)*100) %>%
+  ggplot(aes(adopter, n, fill = good_country, label = paste0(round(n, 2), "%"))) + 
+  geom_col() +
+  geom_text(position=position_stack(0.5))+theme_classic()+
+  labs(title='Percentage of If A Country with 
+More or Less Usage Limit',
+       y='Percentage',x='Adopter After Marketing Campaign',fill='Usage Limit')+
+  scale_x_discrete(label=c('0'='Non-Adopter','1'='Adopter'))+
+  scale_fill_discrete(label=c('0'='More Limit','1'='Less Limit'))
+
+# Interval-Data
+ggthemr("light")
+graph <- xyz_norm %>% mutate(male=as.factor(male), adopter=as.factor(adopter), good_country=as.factor(good_country))
+graph1 <- graph %>% group_by(adopter) %>% 
+  summarise(mean_avg_friend_age=mean(avg_friend_age),
+            mean_subscriber_friend_cnt=mean(subscriber_friend_cnt),
+            mean_songsListened=mean(songsListened),
+            mean_lovedTracks=mean(lovedTracks),
+            mean_playlists=mean(playlists),
+            mean_friend_cnt=mean(friend_cnt),
+            mean_age=mean(age))
+transformdata <- graph1 %>% 
+  pivot_longer(!adopter, names_to = "features", values_to = "mean_of_features")
+
+transformdata %>% ggplot(aes(x=features,y=mean_of_features,fill=adopter))+
+  geom_col(position=position_dodge(),width=0.6)+coord_flip()+scale_y_sqrt()+
+  theme(axis.text.x=element_blank(),axis.title.x=element_blank(),axis.text.y =element_text(size=12,face = 'bold'))+
+  scale_x_discrete(labels=c("mean_avg_friend_age" = "Average Friend Age", "mean_subscriber_friend_cnt" = "Current Friends",
+                            "mean_songsListened" = "Song Listened","mean_lovedTracks" = "Loved Tracks","mean_playlists" = "Playlists",
+                            "mean_friend_cnt" = "Current Friends","mean_age" = "Age"))+
+  scale_fill_discrete(label=c('0'='Non-Adopter','1'='Adopter'))+labs(x='Features',fill='Adopter')+theme(aspect.ratio = 1/2)
+```
+
+4. Modeling
+4.1 XGBoost
+```{r}
+sparse_matrix <- sparse.model.matrix(adopter ~ ., data = xyz_train)
+output_vector = xyz_train$adopter
+bst <- xgboost(data = sparse_matrix, label = output_vector, max_depth = 1,
+               eta = 1, nthread = 3, nrounds = 15,objective = "binary:logistic")
+# Prediction
+matrix_test <- sparse.model.matrix(adopter ~ ., data = xyz_test)
+p0=predict(bst,matrix_test,type='raw')
+#Calculate AUC for this model
+roc_obj <- roc(xyz_test$adopter, p0)
+print(auc(roc_obj))
+# Add precision, recall and f measure for the data
+xyz_test_xgb<-xyz_test %>%
+  mutate(probility=p0)%>%
+  arrange(desc(probility))%>%
+  mutate(precision_pos=cumsum(adopter)/(cumsum(adopter)+cumsum(1-adopter)),
+         recall_pos=cumsum(adopter)/sum(adopter),
+         percentage_data=row_number()/nrow(xyz_test),
+         tpr=cumsum(adopter)/sum(adopter),
+         fpr=cumsum(1-adopter)/sum(1-adopter))%>%
+  mutate(f_measure=2*precision_pos*recall_pos/(precision_pos+recall_pos))%>%
+  replace(is.na(.), 0)
+# Choose best threshold if use f-measure
+a=xyz_test_xgb%>%filter(f_measure==max(xyz_test_xgb$f_measure))
+print(a$f_measure)
+xyz_predicted<-xyz_test_xgb%>%mutate(predic_values=if_else(probility>=a$probility,"predict 1","predict 0"),
+                                   actual_values=if_else(adopter==1,'actual 1','actual 0'))
+print('Confusion Matrix:')
+print(table(xyz_predicted$predic_values, xyz_predicted$actual_values,dnn=c("Prediction","Actual")))
+```
+4.2 Naive Bayes
+```{r}
+fit1 = naiveBayes(as.factor(adopter) ~., data=xyz_train,na.action = na.pass)
+# Prediction
+p1=predict(fit1,xyz_test,type = "raw")[,2]
+#Calculate AUC for this model
+roc_obj <- roc(xyz_test$adopter, p1)
+print(auc(roc_obj))
+# Add precision, recall and f measure for the data
+xyz_test_nb<-xyz_test %>%
+  mutate(probility=p1)%>%
+  arrange(desc(probility))%>%
+  mutate(precision_pos=cumsum(adopter)/(cumsum(adopter)+cumsum(1-adopter)),
+         recall_pos=cumsum(adopter)/sum(adopter),
+         percentage_data=row_number()/nrow(xyz_test),
+         tpr=cumsum(adopter)/sum(adopter),
+         fpr=cumsum(1-adopter)/sum(1-adopter))%>%
+  mutate(f_measure=2*precision_pos*recall_pos/(precision_pos+recall_pos))%>%
+  replace(is.na(.), 0)
+# Choose best threshold if use f-measure
+a=xyz_test_nb%>%filter(f_measure==max(xyz_test_nb$f_measure))
+print(a$f_measure)
+xyz_predicted<-xyz_test_nb%>%mutate(predic_values=if_else(probility>=a$probility,"predict 1","predict 0"),
+                                     actual_values=if_else(adopter==1,'actual 1','actual 0'))
+print('Confusion Matrix:')
+print(table(xyz_predicted$predic_values, xyz_predicted$actual_values,dnn=c("Prediction","Actual")))
+```
+4.3 Logistic Regression
+```{r}
+# Model construction
+#Stepwise model selection to find best model
+full=glm(adopter ~.,family='binomial',data=xyz_train)
+null=glm(adopter ~1,family='binomial',data=xyz_train)
+best_model=step(null,scope=list(lower=null,upper=full),direction="both")
+#best model based on AIC round 1
+fit2<-glm(formula = formula(best_model),  
+          family = "binomial"(link='logit'), data = xyz_train)
+summary(fit2)
+#Drop unsignificant column :delta_good_country 
+#test for Collinearity
+library(car)
+vif(fit2)
+#None greater than 10, so there is no collinearity.
+# Prediction
+p2<-predict(fit2,newdata=xyz_test,type='response')
+#Calculate AUC for this model
+roc_obj <- roc(xyz_test$adopter, p2)
+print(auc(roc_obj))
+# Add precision, recall and f measure for the data
+xyz_test_lg<-xyz_test %>%
+  mutate(probility=p2)%>%
+  arrange(desc(probility))%>%
+  mutate(precision_pos=cumsum(adopter)/(cumsum(adopter)+cumsum(1-adopter)),
+         recall_pos=cumsum(adopter)/sum(adopter),
+         percentage_data=row_number()/nrow(xyz_test),
+         tpr=cumsum(adopter)/sum(adopter),
+         fpr=cumsum(1-adopter)/sum(1-adopter))%>%
+  mutate(f_measure=2*precision_pos*recall_pos/(precision_pos+recall_pos))%>%
+  replace(is.na(.), 0)
+# Choose best threshold if use f-measure
+a=xyz_test_lg%>%filter(f_measure==max(xyz_test_lg$f_measure))
+print(a$f_measure)
+xyz_predicted<-xyz_test_lg%>%mutate(predic_values=if_else(probility>=a$probility,"predict 1","predict 0"),
+                                    actual_values=if_else(adopter==1,'actual 1','actual 0'))
+print('Confusion Matrix:')
+print(table(xyz_predicted$predic_values, xyz_predicted$actual_values,dnn=c("Prediction","Actual")))
+```
+4.4 Random Forest
+```{r}
+xyz.rf<-randomForest(adopter ~.,
+                 xyz_train,ntree=500,importance=T)
+# Prediction
+p3<-predict(xyz.rf, xyz_test, type='response')
+#Calculate AUC for this model
+roc_obj <- roc(xyz_test$adopter, p3)
+print(auc(roc_obj))
+# Add precision, recall and f measure for the data
+xyz_test_rf<-xyz_test %>%
+  mutate(probility=p3)%>%
+  arrange(desc(probility))%>%
+  mutate(precision_pos=cumsum(adopter)/(cumsum(adopter)+cumsum(1-adopter)),
+         recall_pos=cumsum(adopter)/sum(adopter),
+         percentage_data=row_number()/nrow(xyz_test),
+         tpr=cumsum(adopter)/sum(adopter),
+         fpr=cumsum(1-adopter)/sum(1-adopter))%>%
+  mutate(f_measure=2*precision_pos*recall_pos/(precision_pos+recall_pos))%>%
+  replace(is.na(.), 0)
+# Choose best threshold if use f-measure
+a=xyz_test_rf%>%filter(f_measure==max(xyz_test_rf$f_measure))
+print(a$f_measure)
+xyz_predicted<-xyz_test_rf%>%mutate(predic_values=if_else(probility>=a$probility,"predict 1","predict 0"),
+                                    actual_values=if_else(adopter==1,'actual 1','actual 0'))
+print('Confusion Matrix:')
+print(table(xyz_predicted$predic_values, xyz_predicted$actual_values,dnn=c("Prediction","Actual")))
+```
+5. Plotting Model Performance
+```{r}
+#Plot the three model roc
+colors <- c("Xgboost" = "red", "Naive Bayes" = "blue", "Logistic Regression" = "gold","Random Forest"="green")
+```
+5.1 ROC Curve
+```{r}
+ggplot()+
+  geom_line(aes(x=xyz_test_xgb$fpr,y=xyz_test_xgb$tpr,group='Xgboost',color='Xgboost'))+
+  geom_line(aes(x=xyz_test_nb$fpr,y=xyz_test_nb$tpr,group='Naive Bayes',color='Naive Bayes'))+
+  geom_line(aes(x=xyz_test_lg$fpr,y=xyz_test_lg$tpr,group='Logistic Regression',color='Logistic Regression'))+
+  geom_line(aes(x=xyz_test_rf$fpr,y=xyz_test_rf$tpr,group='Random Forest',color='Random Forest'))+
+  ggtitle("ROC curve")+
+  labs(x= 'False Positive Rate', y= 'True Positive Rate',color= 'Legend')+
+  scale_color_manual(values = colors)
+```
+5.2 Precision
+```{r}
+
+
+ggplot()+
+  geom_line(aes(x=xyz_test_xgb$percentage_data,y=xyz_test_xgb$precision_pos,group='Xgboost',color='Xgboost'))+
+  geom_line(aes(x=xyz_test_nb$percentage_data,y=xyz_test_nb$precision_pos,group='Naive Bayes',color='Naive Bayes'))+
+  geom_line(aes(x=xyz_test_lg$percentage_data,y=xyz_test_lg$precision_pos,group='Logistic Regression',color='Logistic Regression'))+
+  geom_line(aes(x=xyz_test_rf$percentage_data,y=xyz_test_rf$precision_pos,group='Random Forest',color='Random Forest'))+
+  ggtitle("Precision")+
+  labs(x= 'Percentage of Data', y= 'Precision',color= 'Legend')+
+  scale_color_manual(values = colors)
+```
+5.3 Recall
+```{r}
+ggplot()+
+  geom_line(aes(x=xyz_test_xgb$percentage_data,y=xyz_test_xgb$tpr,group='Xgboost',color='Xgboost'))+
+  geom_line(aes(x=xyz_test_nb$percentage_data,y=xyz_test_nb$tpr,group='Naive Bayes',color='Naive Bayes'))+
+  geom_line(aes(x=xyz_test_lg$percentage_data,y=xyz_test_lg$tpr,group='Logistic Regression',color='Logistic Regression'))+
+  geom_line(aes(x=xyz_test_rf$percentage_data,y=xyz_test_rf$tpr,group='Random Forest',color='Random Forest'))+
+  ggtitle("Recall")+
+  labs(x= 'Percentage of Data', y= 'Recall',color= 'Legend')+
+  scale_color_manual(values = colors)
+```
+5.4 F-Measure
+```{r}
+ggplot()+
+  geom_line(aes(x=xyz_test_xgb$percentage_data,y=xyz_test_xgb$f_measure,group='Xgboost',color='Xgboost'))+
+  geom_line(aes(x=xyz_test_nb$percentage_data,y=xyz_test_nb$f_measure,group='Naive Bayes',color='Naive Bayes'))+
+  geom_line(aes(x=xyz_test_lg$percentage_data,y=xyz_test_lg$f_measure,group='Logistic Regression',color='Logistic Regression'))+
+  geom_line(aes(x=xyz_test_rf$percentage_data,y=xyz_test_rf$f_measure,group='Random Forest',color='Random Forest'))+
+  ggtitle("F-Measure")+
+  labs(x= 'Percentage of Data', y= 'F-Measure',color= 'Legend')+
+  scale_color_manual(values = colors)
+```
+
+
+
